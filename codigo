@@ -1,0 +1,141 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import openai
+import requests
+import psycopg2
+import smtplib
+import imaplib
+import email
+from email.message import EmailMessage
+from dotenv import load_dotenv
+import os
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+
+# Cargar variables de entorno
+load_dotenv()
+
+# Configuración de OpenAI
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Configuración de FastAPI
+app = FastAPI()
+
+# Configuración de Base de Datos PostgreSQL
+DATABASE_URL = os.getenv("DATABASE_URL")
+conn = psycopg2.connect(DATABASE_URL)
+
+# Configuración de Correo
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+
+# Configuración de Pasarela de Pago (Ejemplo con Wompi)
+WOMPI_PUBLIC_KEY = os.getenv("WOMPI_PUBLIC_KEY")
+WOMPI_PRIVATE_KEY = os.getenv("WOMPI_PRIVATE_KEY")
+WOMPI_PAYMENT_URL = "https://sandbox.wompi.co/v1/transactions"
+
+# Modelo de Datos
+class UserData(BaseModel):
+    name: str
+    id_number: str
+    email: str
+    infraction_code: str
+    vehicle_plate: str
+
+# 1️⃣ Flujo de Recolección de Información
+@app.post("/validate_infraction/")
+def validate_infraction(data: UserData):
+    simit_url = f"https://consulta.simit.org.co/Simit/indexA.jsp?placa={data.vehicle_plate}"
+    response = requests.get(simit_url)
+    
+    if response.status_code == 200:
+        infraction_details = "Detalles de la infracción obtenidos correctamente."
+        return {"status": "ok", "details": infraction_details}
+    else:
+        raise HTTPException(status_code=400, detail="No se pudo obtener la información de la infracción.")
+
+# 2️⃣ Flujo de Cobro del Servicio
+@app.post("/process_payment/")
+def process_payment(data: UserData):
+    payment_payload = {
+        "amount_in_cents": 50000,  # Ejemplo: $50,000 COP
+        "currency": "COP",
+        "customer_email": data.email,
+        "payment_source_id": "EXAMPLE_SOURCE_ID",
+    }
+    headers = {"Authorization": f"Bearer {WOMPI_PRIVATE_KEY}"}
+    response = requests.post(WOMPI_PAYMENT_URL, json=payment_payload, headers=headers)
+
+    if response.status_code == 201:
+        return {"status": "paid", "message": "Pago exitoso"}
+    else:
+        raise HTTPException(status_code=400, detail="Error en el pago")
+
+# 3️⃣ Flujo de Generación de Documento
+@app.post("/generate_document/")
+def generate_document(data: UserData):
+    pdf_path = f"apelacion_{data.id_number}.pdf"
+    c = canvas.Canvas(pdf_path, pagesize=letter)
+    c.drawString(100, 750, f"Apelación de infracción para {data.name}")
+    c.drawString(100, 730, f"Código de infracción: {data.infraction_code}")
+    c.drawString(100, 710, f"Placa del vehículo: {data.vehicle_plate}")
+    c.drawString(100, 690, "Argumentos legales:")
+    c.drawString(120, 670, "- La infracción fue erróneamente aplicada.")
+    c.save()
+
+    return {"status": "document_generated", "pdf_path": pdf_path}
+
+# 4️⃣ Flujo de Envío de Documento
+@app.post("/send_email/")
+def send_email(data: UserData):
+    msg = EmailMessage()
+    msg["Subject"] = "Solicitud de Apelación de Infracción"
+    msg["From"] = EMAIL_USER
+    msg["To"] = "secretaria_transito@example.com"  # Se debe obtener el correo correcto de la entidad
+    msg.set_content(f"Adjunto el documento de apelación de {data.name}, con ID {data.id_number}")
+
+    with open(f"apelacion_{data.id_number}.pdf", "rb") as f:
+        msg.add_attachment(f.read(), maintype="application", subtype="pdf", filename=f"apelacion_{data.id_number}.pdf")
+
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
+
+    return {"status": "email_sent", "message": "Documento enviado correctamente"}
+
+# 5️⃣ Flujo de Seguimiento y Respuesta
+@app.post("/check_email/")
+def check_email():
+    mail = imaplib.IMAP4_SSL(SMTP_SERVER)
+    mail.login(EMAIL_USER, EMAIL_PASS)
+    mail.select("inbox")
+
+    status, messages = mail.search(None, 'FROM "secretaria_transito@example.com"')
+    messages = messages[0].split()
+
+    for msg in messages:
+        status, data = mail.fetch(msg, "(RFC822)")
+        raw_email = data[0][1].decode("utf-8")
+        email_message = email.message_from_string(raw_email)
+
+        subject = email_message["Subject"]
+        if "aprobado" in subject.lower():
+            return {"status": "approved", "message": "Infracción anulada"}
+        elif "rechazado" in subject.lower():
+            return {"status": "denied", "message": "La apelación fue rechazada"}
+
+    return {"status": "no_response", "message": "No hay respuesta aún"}
+
+# 6️⃣ Integración con Chatbot LLM
+@app.post("/chat/")
+def chat(user_input: str):
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": user_input}]
+    )
+    return {"response": response["choices"][0]["message"]["content"]}
+
+
